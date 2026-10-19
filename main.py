@@ -1,18 +1,19 @@
+import os
 import sys
-import database
-from history import History
 from PyQt5.QtCore import *
 from PyQt5.QtWidgets import *
 from PyQt5.QtWebEngineWidgets import *
 from PyQt5.QtGui import *
-from user_management import create_user, get_user
+from storage import DEFAULT_DB, ProfileError, Storage
+
+DEFAULT_HOME = 'http://google.com'
 
 #Tabbed browsing
 class BrowserTab(QWidget):
     def __init__(self, parent=None):
         super(BrowserTab, self).__init__(parent)
         self.browser = QWebEngineView()
-        self.browser.setUrl(QUrl('http://google.com'))
+        self.browser.setUrl(QUrl(window.homepage() if 'window' in globals() else DEFAULT_HOME))
         self.browser.loadProgress.connect(self.update_progress)
         layout = QVBoxLayout()
         layout.addWidget(self.browser)
@@ -20,8 +21,10 @@ class BrowserTab(QWidget):
         self.setLayout(layout)
     
     def navigate_to_url(self, url):
+        if '://' not in url:
+            url = 'http://' + url
+        # History is recorded in SQLite when the page finishes loading (MainWindow.record_visit).
         self.browser.setUrl(QUrl(url))
-        window.history.add_to_history(url)
     def update_progress(self, p):
         window.status.showMessage(f'Loading... {p}%', 2000 if p==100 else 0)
         
@@ -46,27 +49,53 @@ class Omnibox(QLineEdit):
         
 
 class UserProfileDialog(QDialog):
-    def __init__(self, parent=None):
+    """Log in to an existing encrypted profile, or create a new one."""
+
+    def __init__(self, storage, parent=None):
         super(UserProfileDialog, self).__init__(parent)
+        self.storage = storage
+        self.profile = None
         self.setWindowTitle("User Profile")
-        self.username_label = QLabel("Username")
-        self.password_label = QLabel("Password")
         self.username_input = QLineEdit()
         self.password_input = QLineEdit()
-        self.ok_button = QPushButton("OK")
-        self.ok_button.clicked.connect(self.create_user)
+        self.password_input.setEchoMode(QLineEdit.Password)
+        self.message = QLabel("Profiles are AES-256-GCM encrypted on disk with a key derived from your password.")
+        self.message.setWordWrap(True)
+        login_button = QPushButton("Log in")
+        login_button.clicked.connect(self.log_in)
+        create_button = QPushButton("Create profile")
+        create_button.clicked.connect(self.create_profile)
 
         layout = QVBoxLayout()
-        layout.addWidget(self.username_label)
+        layout.addWidget(QLabel("Username"))
         layout.addWidget(self.username_input)
-        layout.addWidget(self.password_label)
+        layout.addWidget(QLabel("Password"))
         layout.addWidget(self.password_input)
-        layout.addWidget(self.ok_button)
-
+        layout.addWidget(login_button)
+        layout.addWidget(create_button)
+        layout.addWidget(self.message)
         self.setLayout(layout)
 
-    def create_user(self):
-        create_user(self.username_input.text(), self.password_input.text())
+    def _credentials(self):
+        return self.username_input.text().strip(), self.password_input.text()
+
+    def log_in(self):
+        username, password = self._credentials()
+        try:
+            self.profile = self.storage.load_profile(username, password)
+        except ProfileError as e:
+            self.message.setText(str(e))
+            return
+        self.accept()
+
+    def create_profile(self):
+        username, password = self._credentials()
+        try:
+            self.storage.create_profile(username, password, {"homepage": DEFAULT_HOME})
+            self.profile = self.storage.load_profile(username, password)
+        except ProfileError as e:
+            self.message.setText(str(e))
+            return
         self.accept()
 
 
@@ -75,14 +104,13 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super(MainWindow, self).__init__()
 
-        # Initialize database
-        self.db = database.Database()
-        
-        # Initialize user
-        self.user = None
+        # History, bookmarks and encrypted profiles live in one SQLite file.
+        self.storage = Storage(os.environ.get('OVERSE_DB', DEFAULT_DB))
 
-        #initialize history
-        self.history = History()
+        # Logged-in profile (decrypted in memory only)
+        self.user = None
+        self.password = None
+        self.profile = {}
 
         history_action = QAction(QIcon('./images/history.png'), 'History', self)
         history_action.triggered.connect(self.show_history)
@@ -114,6 +142,7 @@ class MainWindow(QMainWindow):
                 
         #urlbar
         self.url_bar = Omnibox()
+        self.url_bar.history = self.storage.history()
         self.url_bar.returnPressed.connect(self.navigatetourl)
         navbar.addWidget(self.url_bar)
 
@@ -134,6 +163,10 @@ class MainWindow(QMainWindow):
         select_bookmark_action = QAction(QIcon('./images/selectbookmark.png'), 'Select Bookmark', self)
         select_bookmark_action.triggered.connect(self.select_bookmark)
         navbar.addAction(select_bookmark_action)
+
+        set_home_action = QAction('Set Home', self)
+        set_home_action.triggered.connect(self.set_homepage)
+        navbar.addAction(set_home_action)
         
         self.status = QStatusBar()
         self.setStatusBar(self.status)
@@ -156,7 +189,6 @@ class MainWindow(QMainWindow):
 
 
 
-        self.bookmarks = {}
         self.add_tab()
         
         
@@ -218,9 +250,30 @@ class MainWindow(QMainWindow):
 
 
     def show_user_profile(self):
-        dialog = UserProfileDialog(self)
+        dialog = UserProfileDialog(self.storage, self)
         if dialog.exec_():
-            self.user = get_user(dialog.username_input.text())
+            self.user = dialog.username_input.text().strip()
+            self.password = dialog.password_input.text()
+            self.profile = dialog.profile or {}
+            self.status.showMessage(f'Logged in as {self.user}', 3000)
+
+    def homepage(self):
+        return self.profile.get('homepage', DEFAULT_HOME)
+
+    def set_homepage(self):
+        if not self.user:
+            self.status.showMessage('Log in to a profile to save a homepage', 3000)
+            return
+        self.profile['homepage'] = self.tabs.currentWidget().browser.url().toString()
+        self.storage.save_profile(self.user, self.password, self.profile)
+        self.status.showMessage('Homepage saved to your encrypted profile', 3000)
+
+    def record_visit(self, tab, ok):
+        if not ok:
+            return
+        url = tab.browser.url().toString()
+        self.storage.add_history(url, tab.browser.title())
+        self.url_bar.update_history(url)
 
     def updateurl(self, q):
         self.url_bar.setText(q.toString())
@@ -228,7 +281,7 @@ class MainWindow(QMainWindow):
         
     def navigate_home(self):
         current_tab = self.tabs.currentWidget()
-        current_tab.navigate_to_url('http://google.com')
+        current_tab.navigate_to_url(self.homepage())
 
     def navigatetourl(self):
         url = self.url_bar.text()
@@ -245,11 +298,12 @@ class MainWindow(QMainWindow):
         tab = BrowserTab()
         i = self.tabs.addTab(tab, "New Tab")
         tab.browser.urlChanged.connect(self.updateurl)  # add this line
+        tab.browser.loadFinished.connect(lambda ok, t=tab: self.record_visit(t, ok))
         self.tabs.setCurrentIndex(i)
 
 
     def select_bookmark(self):
-        bookmark, ok = QInputDialog.getItem(self, "Select bookmark", "Select bookmark", list(self.bookmarks.keys()), 0, False)
+        bookmark, ok = QInputDialog.getItem(self, "Select bookmark", "Select bookmark", self.storage.bookmarks(), 0, False)
         if ok and bookmark:
             self.navigate_to_bookmark(bookmark)
 
@@ -261,14 +315,13 @@ class MainWindow(QMainWindow):
     def bookmark_page(self):
         current_tab = self.tabs.currentWidget()
         current_url = current_tab.browser.url().toString()
-        self.bookmarks[current_url] = current_tab
-        print("Bookmarked:", current_url)
+        self.storage.add_bookmark(current_url, current_tab.browser.title())
+        self.status.showMessage(f'Bookmarked {current_url}', 3000)
 
     def navigate_to_bookmark(self, url):
-        if url in self.bookmarks:
-            # Instead of adding a tab, just set the current tab's URL to the bookmarked one
-            current_tab = self.tabs.currentWidget()
-            current_tab.navigate_to_url(url)
+        # Instead of adding a tab, just set the current tab's URL to the bookmarked one
+        current_tab = self.tabs.currentWidget()
+        current_tab.navigate_to_url(url)
         
     def navigate_back(self):
         current_tab = self.tabs.currentWidget()
@@ -283,7 +336,7 @@ class MainWindow(QMainWindow):
         current_tab.browser.reload()
         
     def show_history(self):
-        history, ok = QInputDialog.getItem(self, "History", "Select history", self.history.get_history(), 0, False)
+        history, ok = QInputDialog.getItem(self, "History", "Select history", self.storage.history(), 0, False)
         if ok and history:
             current_tab = self.tabs.currentWidget()
             current_tab.navigate_to_url(history)     

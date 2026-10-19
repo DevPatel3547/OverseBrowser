@@ -19,15 +19,18 @@ Overse comes packed with essential features that make browsing a pleasure:
 - **Tabbed Browsing:** Browse multiple sites at once. Each tab operates independently, allowing for multitasking.
 - **Omnibox:** The smart URL box suggests URLs from your history, making navigation faster.
 - **Navigation Tools:** Includes the essential navigation tools - back, forward, and reload. Plus, a home button to get you back to your homepage.
-- **Bookmarks:** Like a page? Bookmark it! The Bookmark feature makes it easy to return to your favorite pages.
-- **User Profile:** Create and load user profiles for personalized browsing experiences.
-- **History** Stores and allows users to view their activity as well redirect to it.
+- **Bookmarks:** Like a page? Bookmark it! Bookmarks are saved in SQLite and survive restarts.
+- **User Profiles (encrypted):** Create and log in to profiles. Each profile (currently its homepage, set with *Set Home*) is encrypted at rest with AES-256-GCM through the `cryptography` package (OpenSSL). The key is derived from the profile password with scrypt and a random per-profile salt, and the password itself is never stored. A wrong password or modified data fails authentication.
+- **History:** Every page a tab finishes loading is stored in SQLite and can be reopened from the History menu or the Omnibox.
+
+All state lives in one SQLite file, `~/.overse/overse.db` (override with `OVERSE_DB`). See `storage.py`.
 ## Installation and Usage
 
 ### Requirements
 
 - Python 3
-- PyQt5
+- PyQt5 and PyQtWebEngine
+- cryptography
 
 First, clone the repository to your local machine:
 
@@ -35,8 +38,11 @@ git clone https://github.com/DevPatel3547/OverseBrowser.git or you can use ssh, 
 
 Navigate into the cloned repository:
 cd Overse
-Install PyQt5 using pip:
-pip install PyQt5
+Install the dependencies using pip:
+pip install -r requirements.txt
+
+Run the storage tests (no Qt needed):
+pip install cryptography pytest && pytest tests
 
 
 Once you've installed Overse, you're ready to begin browsing. Here's a quick guide to getting started:
